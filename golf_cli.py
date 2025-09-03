@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
 """
-Golf Scorecard CLI with Postgres backend and interactive TUI editing (styled).
+Golf Scorecard CLI with Postgres backend, interactive TUI, and Golf Course API integration.
+- Auto-loads .env via python-dotenv
+- Robust Golf Course API search that tries common auth schemes and paths
+- Interactive score entry with arrow keys (prompt_toolkit styles)
 
-Features
-- Create Scorecard (1–4 players), unique game_id = "<course> - mm/dd/yyyy[#n]"
-- Record Score (menu-driven)
-- Show Scorecard (18×4 grid with Front/Back/Total)
-- Interactive Scorecard (arrow keys to navigate, 1–8 to set strokes, q to quit)
-  * Uses prompt_toolkit styles (no raw ANSI codes) for clean highlighting
-- Total Score ("Player -- # holes complete -- total")
-- All Scorecards (list)
+Menu
+1. Create Scorecard
+2. Record Score
+3. Show Scorecard
+4. Interactive Scorecard
+5. Total Score
+6. All Scorecards
+7. Search Golf Courses
+8. Exit
 
-Dependencies
-- psycopg (v3):   pip install "psycopg[binary]"
-- prompt_toolkit: pip install prompt_toolkit
-
-DB connection
-- Configure via DB_CONN env var, e.g.:
-  export DB_CONN="dbname=golf user=<user> host=localhost"
-- If not set, a default attempts to use your login user and dbname "golf".
+Setup
+- pip install "psycopg[binary]" prompt_toolkit requests python-dotenv
+- .env example:
+    GOLF_API_KEY=YOUR_REAL_KEY_HERE
+    DB_CONN=dbname=golf user=<you> host=localhost
+- If your API uses /api/v1, set:
+    GOLF_API_SEARCH_PATH=/api/v1/courses/search
+  (default is /v1/courses/search)
 """
 from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime
-from typing import List, Tuple
+from datetime import datetime, date
+from typing import List, Tuple, Dict, Any
 
+import requests
 import psycopg
+from dotenv import load_dotenv
 
-# Lazily import prompt_toolkit pieces; we gate interactive mode if unavailable
+# Load environment variables from .env automatically
+load_dotenv()
+
+# ---------- prompt_toolkit (optional, for interactive mode) ----------
 try:
     from prompt_toolkit.application import Application
     from prompt_toolkit.key_binding import KeyBindings
@@ -39,15 +48,12 @@ try:
     from prompt_toolkit.formatted_text import FormattedText
     from prompt_toolkit.styles import Style
     PROMPT_TOOLKIT_AVAILABLE = True
-except Exception:  # pragma: no cover
+except Exception:
     PROMPT_TOOLKIT_AVAILABLE = False
-
 
 # ---------- Configuration ----------
 
 def _default_conn_str() -> str:
-    # Prefer OS user; fall back to "postgres"
-    user = None
     try:
         user = os.getlogin()
     except Exception:
@@ -56,9 +62,19 @@ def _default_conn_str() -> str:
 
 DB_CONN = os.getenv("DB_CONN", _default_conn_str())
 
+# Golf Course API config
+GOLF_API_KEY = os.getenv("GOLF_API_KEY")
+GOLF_API_BASE = os.getenv("GOLF_API_BASE", "https://api.golfcourseapi.com")
+GOLF_API_SEARCH_PATH = os.getenv("GOLF_API_SEARCH_PATH", "/v1/courses/search")  # try "/api/v1/courses/search" if you get 404
+GOLF_API_DEBUG = os.getenv("GOLF_API_DEBUG", "0") == "1"  # set to 1 to print which auth/path succeeded
+
+
+def _api_url(path: str) -> str:
+    base = GOLF_API_BASE.rstrip("/")
+    p = path if path.startswith("/") else f"/{path}"
+    return f"{base}{p}"
 
 # ---------- Schema Bootstrap ----------
-
 SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -87,16 +103,13 @@ CREATE TABLE IF NOT EXISTS scores (
 );
 """
 
-
 def init_db() -> None:
     with psycopg.connect(DB_CONN) as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
         conn.commit()
 
-
 # ---------- Utility & Selection ----------
-
 class MenuError(Exception):
     pass
 
@@ -121,7 +134,12 @@ def prompt_int(prompt: str, min_val: int | None = None, max_val: int | None = No
         return val
 
 
-def parse_date_mmddyyyy(s: str):
+def prompt_with_default(prompt: str, default_val: str) -> str:
+    raw = input(f"{prompt} [{default_val}]: ").strip()
+    return raw or default_val
+
+
+def parse_date_mmddyyyy(s: str) -> date:
     try:
         return datetime.strptime(s, "%m/%d/%Y").date()
     except ValueError:
@@ -150,15 +168,122 @@ def select_game() -> Tuple[str, str]:
     game_uuid, game_id = rows[choice - 1][0], rows[choice - 1][1]
     return game_uuid, game_id
 
+# ---------- Golf Course API Integration ----------
+
+def search_courses_by_name(term: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """Search courses by name, trying common auth schemes and paths.
+
+    Tries in order:
+      - Authorization: Key <API_KEY>
+      - Authorization: Bearer <API_KEY>
+      - x-api-key: <API_KEY>
+      - query string api_key=<API_KEY>
+    And tries both /v1/courses/search and /api/v1/courses/search unless overridden.
+    """
+    if not GOLF_API_KEY:
+        print("❌ GOLF_API_KEY not set. Put it in .env or export it.")
+        return []
+
+    paths = [GOLF_API_SEARCH_PATH or "/v1/courses/search", "/api/v1/courses/search"]
+    # De-dup while preserving order
+    seen = set(); ordered_paths = []
+    for p in paths:
+        if p not in seen:
+            ordered_paths.append(p); seen.add(p)
+
+    auth_styles = ["key", "bearer", "x-api-key", "query"]
+
+    for path in ordered_paths:
+        url = _api_url(path)
+        base_params = {"q": term, "limit": limit}
+        for style in auth_styles:
+            headers = {"Accept": "application/json", "User-Agent": "golf-cli/1.0"}
+            params = dict(base_params)
+            if style == "key":
+                headers["Authorization"] = f"Key {GOLF_API_KEY}"
+            elif style == "bearer":
+                headers["Authorization"] = f"Bearer {GOLF_API_KEY}"
+            elif style == "x-api-key":
+                headers["x-api-key"] = GOLF_API_KEY
+            elif style == "query":
+                params["api_key"] = GOLF_API_KEY
+
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=12)
+                # 404 usually means wrong path; try next path
+                if resp.status_code == 404:
+                    if GOLF_API_DEBUG:
+                        print(f"[debug] 404 on {url} with {style}; trying alternate path…")
+                    break
+                # 401 means auth scheme likely wrong; try next style
+                if resp.status_code == 401:
+                    if GOLF_API_DEBUG:
+                        print(f"[debug] 401 on {url} with {style}; trying another auth scheme…")
+                    continue
+                resp.raise_for_status()
+                data = resp.json() if resp.content else {}
+                if GOLF_API_DEBUG:
+                    print(f"[debug] ✅ success: path={path} auth={style}")
+                # Normalize to a list of dicts
+                raw_courses = data if isinstance(data, list) else (data.get("courses") or data.get("results") or [])
+                courses: List[Dict[str, Any]] = []
+                for c in raw_courses:
+                    courses.append({
+                        "id": c.get("id") or c.get("_id") or c.get("course_id"),
+                        "name": c.get("name") or c.get("course_name") or "(Unnamed Course)",
+                        "city": c.get("city") or c.get("town") or "",
+                        "state": c.get("state") or c.get("region") or "",
+                        "country": c.get("country") or "",
+                    })
+                return courses
+            except requests.RequestException as e:
+                if GOLF_API_DEBUG:
+                    print(f"[debug] exception on {url} with {style}: {e}")
+                continue
+
+    print("❌ API request failed: tried multiple auth styles (Key/Bearer/x-api-key/query) and paths (/v1, /api/v1) but all were unauthorized or not found.")
+    print("   Tips: verify your key, header scheme, and correct path in the API docs/dashboard.")
+    return []
+
+
+def search_courses_interactive() -> None:
+    term = input("Search course name: ").strip()
+    if not term:
+        print("❌ Course name is required.")
+        return
+
+    results = search_courses_by_name(term, limit=10)
+    if not results:
+        print("No courses found.")
+        return
+
+    print(f"\nResults for '{term}':")
+    for idx, c in enumerate(results, start=1):
+        loc_bits = [c.get("city") or "", c.get("state") or "", c.get("country") or ""]
+        loc = ", ".join([b for b in loc_bits if b])
+        print(f"{idx}. {c['name']}{f' — {loc}' if loc else ''}")
+
+    use = input("\nUse one of these to prefill Create Scorecard? (y/N): ").strip().lower()
+    if use != "y":
+        return
+
+    pick = prompt_int("Select course number: ", 1, len(results))
+    picked_name = results[pick - 1]["name"]
+    create_scorecard(prefill_course=picked_name)
 
 # ---------- Actions ----------
 
-def create_scorecard() -> None:
-    course = input("Enter course name: ").strip()
-    if not course:
-        print("❌ Course name required.")
-        return
-    date_str = input("Enter date (mm/dd/yyyy): ").strip()
+def create_scorecard(prefill_course: str | None = None) -> None:
+    if prefill_course:
+        course = prompt_with_default("Enter course name", prefill_course).strip()
+    else:
+        course = input("Enter course name: ").strip()
+        if not course:
+            print("❌ Course name required.")
+            return
+
+    today_str = date.today().strftime("%m/%d/%Y")
+    date_str = prompt_with_default("Enter date (mm/dd/yyyy)", today_str)
     try:
         date_obj = parse_date_mmddyyyy(date_str)
     except MenuError as e:
@@ -167,7 +292,6 @@ def create_scorecard() -> None:
 
     with psycopg.connect(DB_CONN) as conn:
         with conn.cursor() as cur:
-            # Ensure unique display game_id
             base_game_id = f"{course} - {date_str}"
             game_id = base_game_id
             suffix = 1
@@ -187,7 +311,6 @@ def create_scorecard() -> None:
             )
             game_uuid = cur.fetchone()[0]
 
-            # Enter 1–4 players
             players_added = 0
             for idx in range(1, 5):
                 name = input(f"Enter player {idx} name (blank to stop): ").strip()
@@ -277,7 +400,6 @@ def show_scorecard() -> None:
                 cells = [fetch_cell(pid, hole) for pid in player_ids]
                 print(f"{hole:>4} | " + " | ".join(f"{c:<8}" for c in cells))
 
-            # Totals
             def sum_for(pid, holes):
                 cur.execute(
                     "SELECT SUM(strokes) FROM scores WHERE game_id=%s AND player_id=%s AND hole_number = ANY(%s)",
@@ -317,14 +439,9 @@ def total_scores() -> None:
 def all_scorecards() -> None:
     _ = list_games()
 
-
 # ---------- Interactive TUI (styled) ----------
 
 def interactive_scorecard() -> None:
-    """Interactive scorecard using prompt_toolkit styles (no raw ANSI).
-
-    Arrow keys move the selection; 1–8 sets strokes; q quits.
-    """
     if not PROMPT_TOOLKIT_AVAILABLE:
         print("❌ Interactive mode requires 'prompt_toolkit'. Install with: pip install prompt_toolkit")
         return
@@ -335,7 +452,6 @@ def interactive_scorecard() -> None:
         print(f"❌ {e}")
         return
 
-    # Load players (fixed order during session)
     with psycopg.connect(DB_CONN) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id, name FROM players WHERE game_id=%s ORDER BY name", (game_uuid,))
@@ -348,7 +464,6 @@ def interactive_scorecard() -> None:
 
     cursor = {"hole": 1, "player": 0}
 
-    # Styles for header, selected cell, and hint text
     style = Style.from_dict({
         "header": "bold",
         "cell.selected": "reverse",
@@ -356,8 +471,7 @@ def interactive_scorecard() -> None:
     })
 
     def render_tokens() -> FormattedText:
-        tokens = []  # list of (style, text)
-        # Header
+        tokens = []
         header = "Hole | " + " | ".join(f"{n:<8}" for n in player_names) + "\n"
         tokens.append(("class:header", header))
         tokens.append(("", "-" * (len(header) - 1) + "\n"))
@@ -410,7 +524,6 @@ def interactive_scorecard() -> None:
         cursor["hole"] = min(18, cursor["hole"] + 1)
         event.app.invalidate()
 
-    # Number keys 1–8 to set a score for the current cell
     def make_setter(strokes: int):
         def _set(event):
             with psycopg.connect(DB_CONN) as conn3:
@@ -443,7 +556,6 @@ def interactive_scorecard() -> None:
     app = Application(layout=layout, key_bindings=kb, full_screen=True, style=style)
     app.run()
 
-
 # ---------- Main Loop ----------
 
 def main() -> None:
@@ -462,7 +574,8 @@ def main() -> None:
         print("4. Interactive Scorecard")
         print("5. Total Score")
         print("6. All Scorecards")
-        print("7. Exit")
+        print("7. Search Golf Courses")
+        print("8. Exit")
         choice = input("Select option: ").strip()
 
         if choice == "1":
@@ -478,11 +591,12 @@ def main() -> None:
         elif choice == "6":
             all_scorecards()
         elif choice == "7":
+            search_courses_interactive()
+        elif choice == "8":
             print("Goodbye!")
             break
         else:
             print("❌ Invalid choice")
-
 
 if __name__ == "__main__":
     main()
