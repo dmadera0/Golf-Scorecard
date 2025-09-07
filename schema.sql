@@ -26,3 +26,12 @@ CREATE TABLE IF NOT EXISTS scores (
     updated_at TIMESTAMP DEFAULT NOW(),
     UNIQUE (game_id, player_id, hole_number)
 );
+/* Store per-hole par for a given game */
+CREATE TABLE IF NOT EXISTS hole_pars (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    game_id UUID REFERENCES games(id) ON DELETE CASCADE,
+    hole_number INT CHECK (hole_number BETWEEN 1 AND 18),
+    par INT CHECK (par BETWEEN 3 AND 6),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (game_id, hole_number)
+);

@@ -338,7 +338,9 @@ def all_scorecards() -> None:
 def interactive_scorecard() -> None:
     """Interactive scorecard using prompt_toolkit styles (no raw ANSI).
 
-    Arrow keys move the selection; 1–8 sets strokes; q quits.
+    Arrow keys move the selection; q quits.
+    - When Par column is focused (col==0), keys 3–6 set par for that hole.
+    - When a player cell is focused (col>=1), keys 1–8 set strokes for that hole/player.
     """
     if not PROMPT_TOOLKIT_AVAILABLE:
         print("❌ Interactive mode requires 'prompt_toolkit'. Install with: pip install prompt_toolkit")
@@ -350,53 +352,128 @@ def interactive_scorecard() -> None:
         print(f"❌ {e}")
         return
 
+    # Keep a single connection open for the session
+    conn = psycopg.connect(DB_CONN)
+
     # Load players (fixed order during session)
-    with psycopg.connect(DB_CONN) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, name FROM players WHERE game_id=%s ORDER BY name", (game_uuid,))
-            players = cur.fetchall()
-            if not players:
-                print("❌ No players for this game.")
-                return
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM players WHERE game_id=%s ORDER BY name", (game_uuid,))
+        players = cur.fetchall()
+        if not players:
+            print("❌ No players for this game.")
+            conn.close()
+            return
     player_ids = [p[0] for p in players]
     player_names = [p[1] for p in players]
 
-    cursor = {"hole": 1, "player": 0}
+    # Load existing pars and scores into memory
+    with conn.cursor() as cur:
+        cur.execute("SELECT hole_number, par FROM hole_pars WHERE game_id=%s", (game_uuid,))
+        pars = {hole: par for hole, par in cur.fetchall()}
 
-    # Styles for header, selected cell, and hint text
+        cur.execute("""
+            SELECT player_id, hole_number, strokes
+            FROM scores WHERE game_id=%s
+        """, (game_uuid,))
+        scores = {(pid, hole): strokes for pid, hole, strokes in cur.fetchall()}
+
+    # Cursor: col=0 -> Par column; col>=1 -> player index col-1
+    cursor = {"hole": 1, "col": 0}
+
+    # Styles for header, selected cell, hint text and totals
     style = Style.from_dict({
         "header": "bold",
         "cell.selected": "reverse",
         "hint": "italic dim",
+        "totals": "bold",
     })
+
+    # Helpers to write-through to DB and update local caches
+    def set_par(hole: int, par: int) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO hole_pars (game_id, hole_number, par)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (game_id, hole_number)
+                DO UPDATE SET par=EXCLUDED.par, updated_at=NOW()
+                """,
+                (game_uuid, hole, par),
+            )
+        conn.commit()
+        pars[hole] = par
+
+    def set_score(pid: str, hole: int, strokes: int) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO scores (game_id, player_id, hole_number, strokes)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (game_id, player_id, hole_number)
+                DO UPDATE SET strokes=EXCLUDED.strokes, updated_at=NOW()
+                """,
+                (game_uuid, pid, hole, strokes),
+            )
+        conn.commit()
+        scores[(pid, hole)] = strokes
+
+    def sum_par(holes) -> int | None:
+        vals = [pars.get(h) for h in holes if pars.get(h) is not None]
+        return sum(vals) if vals else None
+
+    def sum_strokes(pid: str, holes) -> int | None:
+        vals = [scores.get((pid, h)) for h in holes if scores.get((pid, h)) is not None]
+        return sum(vals) if vals else None
 
     def render_tokens() -> FormattedText:
         tokens = []  # list of (style, text)
-        # Header
-        header = "Hole | " + " | ".join(f"{n:<8}" for n in player_names) + "\n"
+
+        # Header: Hole | Par | players...
+        header = "Hole | Par | " + " | ".join(f"{n:<8}" for n in player_names) + "\n"
         tokens.append(("class:header", header))
         tokens.append(("", "-" * (len(header) - 1) + "\n"))
 
-        with psycopg.connect(DB_CONN) as conn2:
-            with conn2.cursor() as cur2:
-                for hole in range(1, 19):
-                    tokens.append(("", f"{hole:>4} | "))
-                    for idx, pid in enumerate(player_ids):
-                        cur2.execute(
-                            "SELECT strokes FROM scores WHERE game_id=%s AND player_id=%s AND hole_number=%s",
-                            (game_uuid, pid, hole),
-                        )
-                        res = cur2.fetchone()
-                        val = str(res[0]) if res else "-"
-                        cell_text = f"{val:<8}"
-                        if hole == cursor["hole"] and idx == cursor["player"]:
-                            tokens.append(("class:cell.selected", cell_text))
-                        else:
-                            tokens.append(("", cell_text))
-                        if idx < len(player_ids) - 1:
-                            tokens.append(("", " | "))
-                    tokens.append(("", "\n"))
-        tokens.append(("class:hint", "\n(Use ← → ↑ ↓ to move, keys 1–8 to set strokes, q to quit)\n"))
+        # Body rows 1..18
+        for hole in range(1, 19):
+            tokens.append(("", f"{hole:>4} | "))
+
+            # Par cell (col 0)
+            pval = pars.get(hole)
+            ptxt = f"{(str(pval) if pval is not None else '-'): <3}"
+            style_key = "class:cell.selected" if (hole == cursor["hole"] and cursor["col"] == 0) else ""
+            tokens.append((style_key, ptxt))
+            tokens.append(("", " | "))
+
+            # Players cells
+            for idx, pid in enumerate(player_ids):
+                sval = scores.get((pid, hole))
+                stxt = f"{(str(sval) if sval is not None else '-'): <8}"
+                style_key = "class:cell.selected" if (hole == cursor["hole"] and cursor["col"] == idx + 1) else ""
+                tokens.append((style_key, stxt))
+                if idx < len(player_ids) - 1:
+                    tokens.append(("", " | "))
+            tokens.append(("", "\n"))
+
+        # Totals footer: Front / Back / Total
+        def fmt(v: int | None, width: int) -> str:
+            return f"{(str(v) if v is not None else '-'): <{width}}"
+
+        sections = [("Front", range(1, 10)), ("Back", range(10, 19)), ("Total", range(1, 19))]
+        for label, holes in sections:
+            line = f"{label:>4} | "
+            # Par total column width 3
+            p_sum = sum_par(holes)
+            line += fmt(p_sum, 3) + " | "
+            # Each player width 8
+            for idx, pid in enumerate(player_ids):
+                s_sum = sum_strokes(pid, holes)
+                line += fmt(s_sum, 8)
+                if idx < len(player_ids) - 1:
+                    line += " | "
+            line += "\n"
+            tokens.append(("class:totals", line))
+
+        tokens.append(("class:hint", "\n(Use ← → ↑ ↓ to move. On Par column use 3–6 to set par. On player cells use 1–8 to set strokes. Press q to quit.)\n"))
         return FormattedText(tokens)
 
     control = FormattedTextControl(text=render_tokens, focusable=True, show_cursor=False)
@@ -407,12 +484,12 @@ def interactive_scorecard() -> None:
 
     @kb.add("left")
     def _(event):
-        cursor["player"] = max(0, cursor["player"] - 1)
+        cursor["col"] = max(0, cursor["col"] - 1)
         event.app.invalidate()
 
     @kb.add("right")
     def _(event):
-        cursor["player"] = min(len(player_ids) - 1, cursor["player"] + 1)
+        cursor["col"] = min(len(player_ids), cursor["col"] + 1)  # include Par col (0) + players
         event.app.invalidate()
 
     @kb.add("up")
@@ -425,38 +502,32 @@ def interactive_scorecard() -> None:
         cursor["hole"] = min(18, cursor["hole"] + 1)
         event.app.invalidate()
 
-    # Number keys 1–8 to set a score for the current cell
-    def make_setter(strokes: int):
+    # Number keys:
+    # - When on Par column (col==0): allow 3..6
+    # - When on player col (>=1): allow 1..8
+    def make_number_handler(n: int):
         def _set(event):
-            with psycopg.connect(DB_CONN) as conn3:
-                with conn3.cursor() as cur3:
-                    cur3.execute(
-                        """
-                        INSERT INTO scores (game_id, player_id, hole_number, strokes)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (game_id, player_id, hole_number)
-                        DO UPDATE SET strokes=EXCLUDED.strokes, updated_at=NOW()
-                        """,
-                        (
-                            game_uuid,
-                            player_ids[cursor["player"]],
-                            cursor["hole"],
-                            strokes,
-                        ),
-                    )
-                conn3.commit()
+            if cursor["col"] == 0:
+                if 3 <= n <= 6:
+                    set_par(cursor["hole"], n)
+            else:
+                if 1 <= n <= 8:
+                    pid = player_ids[cursor["col"] - 1]
+                    set_score(pid, cursor["hole"], n)
             event.app.invalidate()
         return _set
 
-    for i in range(1, 9):
-        kb.add(str(i))(make_setter(i))
+    for i in range(1, 10):  # 1..9; we validate ranges inside
+        kb.add(str(i))(make_number_handler(i))
 
     @kb.add("q")
     def _(event):
+        conn.close()
         event.app.exit()
 
     app = Application(layout=layout, key_bindings=kb, full_screen=True, style=style)
     app.run()
+
 
 
 # ---------- Main Loop ----------
