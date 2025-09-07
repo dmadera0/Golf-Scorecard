@@ -96,10 +96,32 @@ CREATE TABLE IF NOT EXISTS scores (
 
 
 def init_db() -> None:
+    schema_text = None
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        schema_path = os.path.join(here, "schema.sql")
+        if os.path.exists(schema_path):
+            with open(schema_path, "r", encoding="utf-8") as f:
+                schema_text = f.read()
+    except Exception:
+        schema_text = None
+
+    ddl = schema_text or SCHEMA_SQL
+
     with psycopg.connect(DB_CONN) as conn:
         with conn.cursor() as cur:
-            cur.execute(SCHEMA_SQL)
+            cur.execute(ddl)
+            # Helpful indexes (safe if they already exist)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_scores_lookup
+                  ON scores (game_id, player_id, hole_number);
+                CREATE INDEX IF NOT EXISTS idx_players_game
+                  ON players (game_id);
+                CREATE INDEX IF NOT EXISTS idx_games_created
+                  ON games (created_at DESC);
+            """)
         conn.commit()
+
 
 
 # ---------- Utility & Selection ----------
