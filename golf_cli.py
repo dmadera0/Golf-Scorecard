@@ -354,6 +354,80 @@ def total_scores() -> None:
 def all_scorecards() -> None:
     _ = list_games()
 
+def player_profile() -> None:
+    """Show all rounds, totals, and estimated handicap for a given player."""
+    player_name = input("Enter player name: ").strip()
+    if not player_name:
+        print("❌ Player name required.")
+        return
+
+    with psycopg.connect(DB_CONN) as conn:
+        with conn.cursor() as cur:
+            # Find all matching players (case-insensitive)
+            cur.execute("""
+                SELECT p.id, p.name, g.id AS game_uuid, g.game_id, g.game_date
+                FROM players p
+                JOIN games g ON g.id = p.game_id
+                WHERE LOWER(p.name) = LOWER(%s)
+                ORDER BY g.game_date DESC
+            """, (player_name,))
+            rows = cur.fetchall()
+
+            if not rows:
+                print(f"❌ No records found for player '{player_name}'.")
+                return
+
+            print(f"\n--- Player Profile: {rows[0][1]} ---")
+
+            round_stats = []
+            for player_id, name, game_uuid, game_id, game_date in rows:
+                # Total strokes + holes played
+                cur.execute("""
+                    SELECT COALESCE(SUM(strokes),0), COUNT(strokes)
+                    FROM scores
+                    WHERE game_id=%s AND player_id=%s
+                """, (game_uuid, player_id))
+                total_score, holes_played = cur.fetchone()
+
+                # Course par (if stored)
+                cur.execute("SELECT SUM(par) FROM hole_pars WHERE game_id=%s", (game_uuid,))
+                par_total = cur.fetchone()[0]
+                if par_total is None:
+                    par_total = 72  # default
+
+                diff = total_score - par_total if holes_played == 18 else None
+                round_stats.append((game_id, game_date, total_score, holes_played, par_total, diff))
+
+            # Print rounds
+            for game_id, game_date, score, holes, par_total, diff in round_stats:
+                diff_str = f" | Differential: {diff:+d}" if diff is not None else ""
+                print(f"{game_id} ({game_date})")
+                print(f"  Total Score: {score} ({holes} holes) | Par: {par_total}{diff_str}\n")
+
+            # Summary stats
+            rounds_played = len(round_stats)
+            completed_rounds = [r for r in round_stats if r[3] == 18]
+            diffs = [r[5] for r in completed_rounds if r[5] is not None]
+
+            if diffs:
+                # Handicap = average of lowest 8 diffs out of last 20
+                diffs = diffs[:20]
+                lowest = sorted(diffs)[:min(8, len(diffs))]
+                handicap = sum(lowest) / len(lowest)
+            else:
+                handicap = None
+
+            avg_score = sum(r[2] for r in round_stats) / rounds_played
+
+            print("--- Summary ---")
+            print(f"Rounds Played: {rounds_played}")
+            print(f"Average Score: {avg_score:.1f}")
+            if handicap is not None:
+                print(f"Estimated Handicap: {handicap:.1f}")
+            else:
+                print("Estimated Handicap: N/A (need full 18-hole rounds)")
+
+
 
 # ---------- Interactive TUI (styled) ----------
 
@@ -570,7 +644,8 @@ def main() -> None:
         print("4. Interactive Scorecard")
         print("5. Total Score")
         print("6. All Scorecards")
-        print("7. Exit")
+        print("7. Player Profile")
+        print("8. Exit")
         choice = input("Select option: ").strip()
 
         if choice == "1":
@@ -586,10 +661,13 @@ def main() -> None:
         elif choice == "6":
             all_scorecards()
         elif choice == "7":
+            player_profile()
+        elif choice == "8":
             print("Goodbye!")
-            break
-        else:
-            print("❌ Invalid choice")
+        break
+    else:
+        print("❌ Invalid choice")
+
 
 
 if __name__ == "__main__":
